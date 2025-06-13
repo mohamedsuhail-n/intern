@@ -9,14 +9,17 @@ app = Flask(__name__)
 # Constants
 BUCKET_PATH = "customer_buckets"
 FEATHER_FILENAME = "data.feather"
+INDEX_DIR = "indexes"
 
+# Compute bucket and split using MurmurHash
 def get_bucket_split(customer_id):
     prefix = customer_id[:3]
     prefix_hash = hex(mmh3.hash(prefix, signed=False))
-    bucket_name = prefix_hash[2]
-    split_name = prefix_hash[2:5]
-    return bucket_name, split_name
+    bucket = prefix_hash[2]
+    split = prefix_hash[2:5]
+    return bucket, split
 
+# Load data from a given bucket/split
 def load_customer_data(bucket, split):
     file_path = os.path.join(BUCKET_PATH, bucket, split, FEATHER_FILENAME)
     if os.path.exists(file_path):
@@ -32,42 +35,47 @@ def get_customer():
 
     df = pd.DataFrame()
 
-    # Fast path for customer_id
+    # Fast path if customer_id is provided
     if 'customer_id' in query_params:
         customer_id = query_params.get('customer_id')
         bucket, split = get_bucket_split(customer_id)
         df = load_customer_data(bucket, split)
-
     else:
-        # Try to use index-based optimization
-        found_index = False
+        # Try to use multiple index-based filters
+        all_references = []
         for key, value in query_params.items():
-            index_file = os.path.join("indexes", key, f"{value.strip().lower()}.json")
+            index_file = os.path.join(INDEX_DIR, key, f"{value.strip().lower()}.json")
             if os.path.exists(index_file):
                 with open(index_file) as f:
-                    references = json.load(f)
-                dfs = []
-                for ref in references:
-                    df_part = load_customer_data(ref["bucket"], ref["split"])
-                    if not df_part.empty:
-                        dfs.append(df_part)
-                if dfs:
-                    df = pd.concat(dfs, ignore_index=True)
-                    found_index = True
-                    break  # Use only the first matching index
+                    refs = json.load(f)
+                    ref_set = {(ref["bucket"], ref["split"]) for ref in refs}
+                    all_references.append(ref_set)
 
-        # If no index matched, fallback to loading all
-        if not found_index:
-            dfs = []
+        dfs = []
+
+        if all_references:
+            # Intersection across all index filter sets
+            matched_refs = set.intersection(*all_references)
+            for bucket, split in matched_refs:
+                df_part = load_customer_data(bucket, split)
+                if not df_part.empty:
+                    dfs.append(df_part)
+            if dfs:
+                df = pd.concat(dfs, ignore_index=True)
+        else:
+            # No matching indexes — fallback to load all
             for bucket in os.listdir(BUCKET_PATH):
-                for split in os.listdir(os.path.join(BUCKET_PATH, bucket)):
+                bucket_path = os.path.join(BUCKET_PATH, bucket)
+                if not os.path.isdir(bucket_path):
+                    continue
+                for split in os.listdir(bucket_path):
                     df_part = load_customer_data(bucket, split)
                     if not df_part.empty:
                         dfs.append(df_part)
             if dfs:
                 df = pd.concat(dfs, ignore_index=True)
 
-    # Apply any additional filters directly
+    # Final filtering on loaded data (for correctness)
     for key, value in query_params.items():
         if key in df.columns:
             df = df[df[key].astype(str).str.lower() == value.lower()]
